@@ -1,5 +1,4 @@
-
-name: Build Kyverno Offline Bundle
+name: Kyverno Offline Bundle
 
 on:
   workflow_dispatch:
@@ -7,252 +6,70 @@ on:
 permissions:
   contents: read
 
-env:
-  KYVERNO_VERSION: v1.11.4
-  OFFLINE_REGISTRY: repo.nexus.local:32082
-  OFFLINE_PREFIX: kyverno
-
 jobs:
-  build-offline-bundle:
+  build-bundle:
     runs-on: ubuntu-latest
-
+    timeout-minutes: 45
     steps:
-      - name: Install dependencies
+      - name: Create image list
+        shell: bash
         run: |
-          set -euo pipefail
-          python3 -m pip install PyYAML --break-system-packages
+          cat > images.txt <<'IMAGES'
+          ghcr.io/kyverno/kyvernopre:v1.11.1
+          ghcr.io/kyverno/kyverno:v1.11.1
+          ghcr.io/kyverno/background-controller:v1.11.1
+          ghcr.io/kyverno/cleanup-controller:v1.11.1
+          ghcr.io/kyverno/reports-controller:v1.11.1
+          IMAGES
+          sort -u -o images.txt images.txt
+          test "$(wc -l < images.txt)" -eq 5
+          cat images.txt
 
-      - name: Download official manifest
+      - name: Pull five images (linux/amd64)
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p bundle
-
-          curl -fL --retry 3 \
-            "https://github.com/kyverno/kyverno/releases/download/${KYVERNO_VERSION}/install.yaml" \
-            -o bundle/install.yaml
-
-          test -s bundle/install.yaml
-
-      - name: Extract images and rewrite manifest
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          python3 <<'PY'
-          import os
-          import yaml
-          import hashlib
-          from pathlib import Path
-
-          bundle = Path("bundle")
-          registry = os.environ["OFFLINE_REGISTRY"].rstrip("/")
-          prefix = os.environ["OFFLINE_PREFIX"].strip("/")
-
-          with (bundle / "install.yaml").open() as f:
-              docs = list(yaml.safe_load_all(f))
-
-          # Collect image references specifically from
-          # container definitions, including init containers.
-          images = set()
-
-          container_fields = {
-              "containers",
-              "initContainers",
-              "ephemeralContainers",
-          }
-
-          def collect(obj):
-              if isinstance(obj, dict):
-                  for key, value in obj.items():
-                      if key in container_fields and isinstance(value, list):
-                          for container in value:
-                              if not isinstance(container, dict):
-                                  continue
-
-                              image = container.get("image")
-                              if isinstance(image, str) and image:
-                                  images.add(image)
-
-                      collect(value)
-
-              elif isinstance(obj, list):
-                  for item in obj:
-                      collect(item)
-
-          for document in docs:
-              collect(document)
-
-          if not images:
-              raise RuntimeError(
-                  "No container images found in manifest"
-              )
-
-          mapping = {}
-
-          for source in sorted(images):
-              digest = hashlib.sha256(
-                  source.encode("utf-8")
-              ).hexdigest()[:16]
-
-              target = (
-                  f"{registry}/{prefix}/"
-                  f"image-{digest}:offline"
-              )
-
-              mapping[source] = target
-
-          # Rewrite only real container image references.
-          def replace(obj):
-              if isinstance(obj, dict):
-                  for key, value in obj.items():
-                      if key in container_fields and isinstance(value, list):
-                          for container in value:
-                              if not isinstance(container, dict):
-                                  continue
-
-                              source = container.get("image")
-
-                              if (
-                                  isinstance(source, str)
-                                  and source in mapping
-                              ):
-                                  container["image"] = mapping[source]
-
-                      replace(value)
-
-              elif isinstance(obj, list):
-                  for item in obj:
-                      replace(item)
-
-          for document in docs:
-              replace(document)
-
-          with (bundle / "install-offline.yaml").open("w") as f:
-              yaml.safe_dump_all(
-                  docs,
-                  f,
-                  sort_keys=False,
-                  explicit_start=True
-              )
-
-          with (bundle / "images.txt").open("w") as f:
-              for image in sorted(mapping):
-                  f.write(image + "\n")
-
-          with (bundle / "image-map.tsv").open("w") as f:
-              for source, target in sorted(mapping.items()):
-                  f.write(f"{source}\t{target}\n")
-
-          print(f"Total unique images: {len(mapping)}")
-
-          for source, target in sorted(mapping.items()):
-              print(f"{source} -> {target}")
-          PY
-
-      - name: Pull all unique images
-        shell: bash
-        run: |
-          set -euo pipefail
-
           while IFS= read -r image; do
-            echo "Pulling $image"
             docker pull --platform linux/amd64 "$image"
-          done < bundle/images.txt
+          done < images.txt
 
-      - name: Save images to one TAR
+      - name: Save exactly one Docker archive
         shell: bash
         run: |
           set -euo pipefail
-
-          mapfile -t IMAGES < bundle/images.txt
-
-          docker save \
-            -o bundle/images.tar \
-            "${IMAGES[@]}"
-
-          test -s bundle/images.tar
-
-      - name: Generate load and push script
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          cat > bundle/load-and-push.sh <<'EOF'
-          #!/usr/bin/env bash
-          set -euo pipefail
-
-          cd "$(dirname "$0")"
-
-          docker load -i images.tar
-
-          while IFS=$'\t' read -r source target; do
-            echo "Tagging: $source -> $target"
-            docker tag "$source" "$target"
-
-            echo "Pushing: $target"
-            docker push "$target"
-          done < image-map.tsv
-
-          echo "All images pushed successfully"
-          EOF
-
-          chmod +x bundle/load-and-push.sh
-
-      - name: Validate offline bundle
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          python3 <<'PY'
-          import yaml
-
-          with open("bundle/install-offline.yaml") as f:
-              docs = list(yaml.safe_load_all(f))
-
-          assert docs, "Manifest is empty"
-
-          with open("bundle/images.txt") as f:
-              images = [
-                  x.strip() for x in f if x.strip()
-              ]
-
-          assert images, "No images"
-          assert len(images) == len(set(images)), \
-              "Duplicate images detected"
-
-          print("YAML validation passed")
-          print("Unique images:", len(images))
-          PY
-
-          bash -n bundle/load-and-push.sh
+          mapfile -t images < images.txt
+          docker save -o kyverno-v1.11.1-amd64.tar "${images[@]}"
+          tar -tf kyverno-v1.11.1-amd64.tar | grep -q manifest.json
 
       - name: Create ZIP bundle
         shell: bash
         run: |
           set -euo pipefail
+          cat > README.txt <<'README'
+          Kyverno v1.11.1 - Linux AMD64 offline image bundle
 
-          ZIP_NAME="kyverno-offline-${KYVERNO_VERSION}.zip"
+          This ZIP contains ONE Docker archive with five distinct image tags.
+          The docker save archive stores shared layers once, where applicable.
 
-          cd bundle
+          1. Extract the ZIP:
+             unzip kyverno-v1.11.1-amd64-offline.zip
+          2. Import into Docker:
+             docker load -i kyverno-v1.11.1-amd64.tar
+          3. Or import to containerd in Kubernetes namespace:
+             sudo ctr -n k8s.io images import kyverno-v1.11.1-amd64.tar
 
-          zip -q -0 "../${ZIP_NAME}" \
-            install.yaml \
-            install-offline.yaml \
-            images.tar \
-            images.txt \
-            image-map.tsv \
-            load-and-push.sh
+          For an offline cluster using an internal registry, retag and push
+          the five images to the internal registry and update install.yaml.
+          README
+          sha256sum kyverno-v1.11.1-amd64.tar > SHA256SUMS.txt
+          zip -9 kyverno-v1.11.1-amd64-offline.zip kyverno-v1.11.1-amd64.tar images.txt README.txt SHA256SUMS.txt
+          unzip -l kyverno-v1.11.1-amd64-offline.zip
 
-          cd ..
-
-          ls -lh "${ZIP_NAME}"
-
-      - name: Upload offline bundle
+      - name: Upload single ZIP artifact
         uses: actions/upload-artifact@v4
         with:
-          name: kyverno-offline-bundle
-          path: kyverno-offline-${{ env.KYVERNO_VERSION }}.zip
-          compression-level: 0
-          retention-days: 7
+          name: kyverno-v1.11.1-amd64-offline
+          path: kyverno-v1.11.1-amd64-offline.zip
           if-no-files-found: error
+          retention-days: 7
+          compression-level: 0

@@ -1,4 +1,4 @@
-name: Kyverno Offline Bundle
+name: Kyverno Offline Images (individual TAR files)
 
 on:
   workflow_dispatch:
@@ -7,69 +7,51 @@ permissions:
   contents: read
 
 jobs:
-  build-bundle:
+  export-image:
+    name: Export ${{ matrix.component }}
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - component: kyvernopre
+            image: ghcr.io/kyverno/kyvernopre:v1.11.1
+          - component: kyverno
+            image: ghcr.io/kyverno/kyverno:v1.11.1
+          - component: background-controller
+            image: ghcr.io/kyverno/background-controller:v1.11.1
+          - component: cleanup-controller
+            image: ghcr.io/kyverno/cleanup-controller:v1.11.1
+          - component: reports-controller
+            image: ghcr.io/kyverno/reports-controller:v1.11.1
+
     steps:
-      - name: Create image list
-        shell: bash
-        run: |
-          cat > images.txt <<'IMAGES'
-          ghcr.io/kyverno/kyvernopre:v1.11.1
-          ghcr.io/kyverno/kyverno:v1.11.1
-          ghcr.io/kyverno/background-controller:v1.11.1
-          ghcr.io/kyverno/cleanup-controller:v1.11.1
-          ghcr.io/kyverno/reports-controller:v1.11.1
-          IMAGES
-          sort -u -o images.txt images.txt
-          test "$(wc -l < images.txt)" -eq 5
-          cat images.txt
-
-      - name: Pull five images (linux/amd64)
-        shell: bash
+      - name: Pull image for linux/amd64
+        env:
+          IMAGE: ${{ matrix.image }}
         run: |
           set -euo pipefail
-          while IFS= read -r image; do
-            docker pull --platform linux/amd64 "$image"
-          done < images.txt
+          docker pull --platform linux/amd64 "$IMAGE"
 
-      - name: Save exactly one Docker archive
-        shell: bash
+      - name: Save this image to its own TAR
+        env:
+          IMAGE: ${{ matrix.image }}
+          COMPONENT: ${{ matrix.component }}
         run: |
           set -euo pipefail
-          mapfile -t images < images.txt
-          docker save -o kyverno-v1.11.1-amd64.tar "${images[@]}"
-          tar -tf kyverno-v1.11.1-amd64.tar | grep -q manifest.json
+          TAR_NAME="kyverno-${COMPONENT}-v1.11.1-amd64.tar"
+          docker save --output "$TAR_NAME" "$IMAGE"
+          test -s "$TAR_NAME"
+          tar -tf "$TAR_NAME" | grep -q '^manifest.json$'
+          echo "Archive created: $TAR_NAME"
+          ls -lh "$TAR_NAME"
 
-      - name: Create ZIP bundle
-        shell: bash
-        run: |
-          set -euo pipefail
-          cat > README.txt <<'README'
-          Kyverno v1.11.1 - Linux AMD64 offline image bundle
-
-          This ZIP contains ONE Docker archive with five distinct image tags.
-          The docker save archive stores shared layers once, where applicable.
-
-          1. Extract the ZIP:
-             unzip kyverno-v1.11.1-amd64-offline.zip
-          2. Import into Docker:
-             docker load -i kyverno-v1.11.1-amd64.tar
-          3. Or import to containerd in Kubernetes namespace:
-             sudo ctr -n k8s.io images import kyverno-v1.11.1-amd64.tar
-
-          For an offline cluster using an internal registry, retag and push
-          the five images to the internal registry and update install.yaml.
-          README
-          sha256sum kyverno-v1.11.1-amd64.tar > SHA256SUMS.txt
-          zip -9 kyverno-v1.11.1-amd64-offline.zip kyverno-v1.11.1-amd64.tar images.txt README.txt SHA256SUMS.txt
-          unzip -l kyverno-v1.11.1-amd64-offline.zip
-
-      - name: Upload single ZIP artifact
+      - name: Upload one TAR per component
         uses: actions/upload-artifact@v4
         with:
-          name: kyverno-v1.11.1-amd64-offline
-          path: kyverno-v1.11.1-amd64-offline.zip
+          name: kyverno-${{ matrix.component }}-v1.11.1-amd64
+          path: kyverno-${{ matrix.component }}-v1.11.1-amd64.tar
           if-no-files-found: error
-          retention-days: 7
           compression-level: 0
+          retention-days: 7
